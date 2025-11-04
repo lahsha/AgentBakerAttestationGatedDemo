@@ -128,9 +128,20 @@ const (
 
 // Feature Flags.
 const (
-	BlockOutboundInternet = "BlockOutboundInternet"
-	CSERunInBackground    = "CSERunInBackground"
-	EnableIPv6DualStack   = "EnableIPv6DualStack"
-	EnableIPv6Only        = "EnableIPv6Only"
-	EnableWinDSR          = "EnableWinDSR"
+	BlockOutboundInternet     = "BlockOutboundInternet"
+	CSERunInBackground        = "CSERunInBackground"
+	EnableIPv6DualStack       = "EnableIPv6DualStack"
+	EnableIPv6Only            = "EnableIPv6Only"
+	EnableWinDSR              = "EnableWinDSR"
+	EnableNodeAttestationGate = "EnableNodeAttestationGate"
+)
+
+const (
+	// existing entries...
+	measureTLSBootstrappingLatencyService = "linux/cloud-init/artifacts/measure-tls-bootstrapping-latency.service"
+
+	// NEW attestation artifacts
+	attestScript             = "linux/cloud-init/artifacts/attest.sh"
+	attestSystemdService     = "linux/cloud-init/artifacts/attest.service"
+	kubeletAttestationDropin = "linux/cloud-init/artifacts/kubelet.service.d/10-attestation.conf"
 )

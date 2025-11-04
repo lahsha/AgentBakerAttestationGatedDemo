@@ -1,0 +1,22 @@
+[Unit]
+Description=Node Attestation Gate
+DefaultDependencies=no
+After=network-online.target
+Wants=network-online.target
+Before=kubelet.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/azure/containers/attest.sh
+RemainAfterExit=yes
+StandardOutput=journal+console
+StandardError=journal+console
+Restart=on-failure
+RestartSec=30
+StartLimitIntervalSec=600
+StartLimitBurst=5
+RestartPreventExitStatus=10
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

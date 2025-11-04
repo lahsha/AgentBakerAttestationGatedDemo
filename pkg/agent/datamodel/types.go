@@ -444,11 +444,12 @@ type CustomCloudEnv struct {
 
 // FeatureFlags defines feature-flag restricted functionality.
 type FeatureFlags struct {
-	EnableCSERunInBackground bool `json:"enableCSERunInBackground,omitempty"`
-	BlockOutboundInternet    bool `json:"blockOutboundInternet,omitempty"`
-	EnableIPv6DualStack      bool `json:"enableIPv6DualStack,omitempty"`
-	EnableIPv6Only           bool `json:"enableIPv6Only,omitempty"`
-	EnableWinDSR             bool `json:"enableWinDSR,omitempty"`
+	EnableCSERunInBackground  bool `json:"enableCSERunInBackground,omitempty"`
+	BlockOutboundInternet     bool `json:"blockOutboundInternet,omitempty"`
+	EnableIPv6DualStack       bool `json:"enableIPv6DualStack,omitempty"`
+	EnableIPv6Only            bool `json:"enableIPv6Only,omitempty"`
+	EnableWinDSR              bool `json:"enableWinDSR,omitempty"`
+	EnableNodeAttestationGate bool `json:"enableNodeAttestationGate,omitempty"`
 }
 
 // AddonProfile represents an addon for managed cluster.
@@ -1461,6 +1462,8 @@ func (f *FeatureFlags) IsFeatureEnabled(feature string) bool {
 			return f.EnableIPv6Only
 		case EnableWinDSR:
 			return f.EnableWinDSR
+		case EnableNodeAttestationGate:
+			return f.EnableNodeAttestationGate
 		default:
 			return false
 		}

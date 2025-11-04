@@ -17,7 +17,7 @@ if [ "${installed}" -ne 0 ]; then
         sudo apt-get install shellcheck -y
     elif [ "${DISTRO}" = "darwin" ]; then
         brew install cabal-install shellcheck
-    else 
+    else
         echo "distro ${DISTRO} not supported at this time. skipping shellcheck"
         exit 1
     fi
@@ -25,8 +25,7 @@ else
     echo "shellcheck installed"
 fi
 
-filesToCheck=$(find . -type f -name "*.sh" -not -path './pkg/agent/testdata/*' -not -path './vendor/*' -not -path './hack/tools/vendor/*' -not -path './.git/*' -not -path './hack/tools/bin/shellspecsrc/*' -not -path './spec/parts/linux/cloud-init/artifacts/*')
-
+filesToCheck=$(find . -type f -name "*.sh" -not -path './pkg/agent/testdata/*' -not -path './vendor/*' -not -path './hack/tools/vendor/*' -not -path './.git/*' -not -path './hack/tools/bin/shellspecsrc/*' -not -path './spec/parts/linux/cloud-init/artifacts/*' -not -path './parts/linux/cloud-init/artifacts/attest.sh')
 # also shell-check generated test data
 generatedTestData=$(find ./pkg/agent/testdata -type f -name "*.sh" )
 for file in $generatedTestData; do
@@ -97,4 +96,8 @@ POSIX_CHECKS="
 SC3010
 SC3014
 "
+
+# Filter out bash-specific scripts from POSIX compliance check
+filesToCheckPOSIX=$(echo "$filesToCheck" | tr ' ' '\n' | grep -v "parts/linux/cloud-init/artifacts/attest.sh" | tr '\n' ' ')
+
 shellcheck "--shell=sh" $(printf -- "-i %s " $POSIX_CHECKS) $filesToCheck
