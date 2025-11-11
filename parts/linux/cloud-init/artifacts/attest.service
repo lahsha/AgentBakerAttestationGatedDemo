@@ -4,6 +4,8 @@ DefaultDependencies=no
 After=network-online.target
 Wants=network-online.target
 Before=kubelet.service
+StartLimitIntervalSec=600
+StartLimitBurst=5
 
 [Service]
 Type=oneshot
@@ -13,8 +15,6 @@ StandardOutput=journal+console
 StandardError=journal+console
 Restart=on-failure
 RestartSec=30
-StartLimitIntervalSec=600
-StartLimitBurst=5
 RestartPreventExitStatus=10
 TimeoutStartSec=300
 
