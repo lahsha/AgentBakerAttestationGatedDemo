@@ -1,7 +1,8 @@
+# /etc/systemd/system/attest.service
 [Unit]
 Description=Node Attestation Gate
 DefaultDependencies=no
-After=network-online.target
+After=network-online.target containerd.service
 Wants=network-online.target
 Before=kubelet.service
 StartLimitIntervalSec=600
@@ -9,14 +10,17 @@ StartLimitBurst=5
 
 [Service]
 Type=oneshot
+EnvironmentFile=-/etc/default/attest
 ExecStart=/opt/azure/containers/attest.sh
+# Post step applies taints/labels based on /var/lib/attest/status.json
+ExecStartPost=/usr/local/bin/attest-gating.sh
 RemainAfterExit=yes
-StandardOutput=journal+console
-StandardError=journal+console
+StandardOutput=journal
+StandardError=journal
 Restart=on-failure
-RestartSec=30
+RestartSec=20
 RestartPreventExitStatus=10
-TimeoutStartSec=300
+TimeoutStartSec=120
 
 [Install]
 WantedBy=multi-user.target

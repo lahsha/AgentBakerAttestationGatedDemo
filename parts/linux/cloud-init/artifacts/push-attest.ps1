@@ -1,175 +1,262 @@
-<#
-  push-attest.ps1
-  Push attestation artifacts to a single AKS VMSS instance, install deps, enable the gate, and restart kubelet.
-
-  Artifacts used from your repo (relative to this script):
-    - ./attest.sh
-    - ./attest.service
-    - ./kubelet.service.d/10-attestation.conf
-#>
-
 [CmdletBinding()]
 param(
-  [Parameter(Mandatory = $true)] [string] $AksResourceGroup,
-  [Parameter(Mandatory = $true)] [string] $ClusterName,
-  [Parameter(Mandatory = $true)] [string] $NodeName,
-
-  # Defaults relative to this script file
-  [string] $AttestLocal = "$PSScriptRoot/attest.sh",
-  [string] $UnitLocal   = "$PSScriptRoot/attest.service",
-  [string] $DropInLocal = "$PSScriptRoot/kubelet.service.d/10-attestation.conf",
-
-  [switch] $RequireLocalScript,
-  [switch] $VerboseRemote
+  [Parameter(Mandatory=$true)][string]$AksResourceGroup,
+  [Parameter(Mandatory=$true)][string]$ClusterName,
+  [Parameter(Mandatory=$true)][string]$NodeName,
+  [ValidateSet('AUTO','VERIFY','STUB','MOCK')][string]$Mode='AUTO',
+  [string]$VerifierUrl='',
+  [string]$ChallengeUrl='',
+  [switch]$SkipPrereqs,
+  [int]$TimeoutStartSec = 120,
+  [int]$RestartSec = 20,
+  [switch]$EnableGating,
+  [switch]$EnableGatingRefreshTimer,
+  [string]$TaintKey='attest',
+  [string]$TaintValue='failed',
+  [string]$TaintEffect='NoSchedule',
+  [string]$LabelKey='attestation',
+  [string]$LabelPassed='passed',
+  [string]$LabelFailed='failed',
+  [switch]$RequireStatusFile,
+  [string]$ScriptVersion='2025.11.15',
+  [string]$ArtifactsDir = "$(Split-Path -Parent $PSCommandPath)"
 )
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = 'Stop'
 
-function Read-LFOrFallback {
-  param(
-    [Parameter(Mandatory)] [string] $Path,
-    [string] $Fallback = "",
-    [switch] $Mandatory,
-    [switch] $IsScript
-  )
-  if (Test-Path -LiteralPath $Path) {
-    # Normalize CRLF to LF for remote
-    (Get-Content -Raw -LiteralPath $Path) -replace "`r`n","`n" -replace "`r","`n"
-  } else {
-    if ($Mandatory) { throw "Missing mandatory local file: $Path" }
-    if ($IsScript) {
-      if ($Fallback) { return $Fallback }
-      throw "Local script missing and no fallback provided: $Path"
-    }
-    throw "Missing file: $Path"
+function Resolve-NodeIdentity {
+  Write-Host "Resolving nodeResourceGroup..."
+  $nodeRG = az aks show -g $AksResourceGroup -n $ClusterName --query nodeResourceGroup -o tsv
+  if (-not $nodeRG) { throw "Could not resolve nodeResourceGroup" }
+  Write-Host "Fetching providerID for $NodeName..."
+  $provId = kubectl get node $NodeName -o jsonpath='{.spec.providerID}' 2>$null
+  if (-not $provId) { throw "Could not get providerID for $NodeName" }
+  $m = [Regex]::Match($provId,'virtualMachineScaleSets/([^/]+)/virtualMachines/([^/]+)')
+  if (-not $m.Success) { throw "Could not parse providerID '$provId'" }
+  @{
+    NodeResourceGroup = $nodeRG
+    Vmss       = $m.Groups[1].Value
+    InstanceId = $m.Groups[2].Value
   }
 }
 
-Write-Host "Resolving nodeResourceGroup..."
-$NodeRG = az aks show -g $AksResourceGroup -n $ClusterName --query nodeResourceGroup -o tsv
-if (-not $NodeRG) { throw "Could not resolve nodeResourceGroup for '$ClusterName' in '$AksResourceGroup'" }
+function Load-FileOrDie([string]$Path, [string]$Name) {
+  if (-not (Test-Path -LiteralPath $Path)) {
+    throw "Missing required $Name file at path: $Path"
+  }
+  $content = [IO.File]::ReadAllText($Path, [Text.UTF8Encoding]::UTF8)
+  if (-not $content.Trim()) { throw "$Name file empty: $Path" }
+  return $content
+}
 
-Write-Host "Fetching providerID for $NodeName..."
-$ProvId = kubectl get node $NodeName -o jsonpath='{.spec.providerID}'
-if (-not $ProvId) { throw "providerID missing for node $NodeName" }
+function Patch-ServiceUnit([string]$Content) {
+  # Ensure [Service] section exists
+  if ($Content -notmatch '(?m)^\[Service\]') {
+    $Content = $Content.TrimEnd() + "`n[Service]`n"
+  }
 
-$Match = [regex]::Match($ProvId, 'virtualMachineScaleSets/([^/]+)/virtualMachines/([^/]+)', 'IgnoreCase')
-if (-not $Match.Success) { throw "Unable to parse VMSS and Instance ID from providerID: $ProvId" }
-$VMSS = $Match.Groups[1].Value
-$IID  = $Match.Groups[2].Value
-Write-Host "Target => NodeRG=$NodeRG VMSS=$VMSS IID=$IID"
+  # TimeoutStartSec
+  if ($Content -match '(?m)^TimeoutStartSec=\d+') {
+    $Content = [Regex]::Replace($Content,'(?m)^TimeoutStartSec=\d+',"TimeoutStartSec=$TimeoutStartSec")
+  } else {
+    $Content = $Content -replace '(?m)^\[Service\]',"[Service]`nTimeoutStartSec=$TimeoutStartSec"
+  }
 
-# Load artifacts strictly from repo
-$AttestRaw = Read-LFOrFallback -Path $AttestLocal -Mandatory:$RequireLocalScript -IsScript
-$UnitRaw   = Read-LFOrFallback -Path $UnitLocal   -Mandatory
-$DropRaw   = Read-LFOrFallback -Path $DropInLocal -Mandatory
+  # RestartSec
+  if ($Content -match '(?m)^RestartSec=\d+') {
+    $Content = [Regex]::Replace($Content,'(?m)^RestartSec=\d+',"RestartSec=$RestartSec")
+  } else {
+    $Content = $Content -replace '(?m)^\[Service\]',"[Service]`nRestartSec=$RestartSec"
+  }
 
-# Encode artifacts for transport
-$AttestB64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($AttestRaw))
-$UnitB64   = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($UnitRaw))
-$DropB64   = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($DropRaw))
+  # ExecStartPost gating (inject if enabled)
+  if ($EnableGating) {
+    if ($Content -notmatch '(?m)^ExecStartPost=/usr/local/bin/attest-gating\.sh') {
+      # Place after existing ExecStart line if present, else append at end of [Service]
+      if ($Content -match '(?m)^ExecStart=') {
+        $Content = $Content -replace '(?m)^ExecStart=.*$',{
+          $_ + "`nExecStartPost=/usr/local/bin/attest-gating.sh"
+        }
+      } else {
+        $Content = $Content -replace '(?m)^\[Service\]',"[Service]`nExecStartPost=/usr/local/bin/attest-gating.sh"
+      }
+    }
+  } else {
+    # If gating disabled, strip any lingering ExecStartPost line referencing attest-gating
+    $Content = [Regex]::Replace($Content,'(?m)^ExecStartPost=/usr/local/bin/attest-gating\.sh\s*','')
+  }
 
-# Remote script with small guardrails
-$remoteTemplate = @'
+  return $Content
+}
+
+$info = Resolve-NodeIdentity
+Write-Host "Target => NodeRG=$($info.NodeResourceGroup) VMSS=$($info.Vmss) IID=$($info.InstanceId)"
+
+# Paths (no templates now)
+$attestScriptPath  = Join-Path $ArtifactsDir 'attest.sh'
+$servicePath       = Join-Path $ArtifactsDir 'attest.service'
+$gatingScriptPath  = Join-Path $ArtifactsDir 'attest-gating.sh'
+$dropinPath        = Join-Path $ArtifactsDir 'kubelet.attestation.dropin'   # optional plain file
+
+$AttestScriptRaw = Load-FileOrDie $attestScriptPath 'attest.sh'
+$ServiceRaw      = Load-FileOrDie $servicePath 'attest.service'
+
+$GatingScriptRaw = $null
+if ($EnableGating) {
+  if (Test-Path $gatingScriptPath) {
+    $GatingScriptRaw = Load-FileOrDie $gatingScriptPath 'attest-gating.sh'
+  } else {
+    throw "Gating requested but gating script not found at $gatingScriptPath"
+  }
+}
+
+# Version placeholder in attest.sh
+$AttestScript = $AttestScriptRaw -replace '__SCRIPT_VERSION__', $ScriptVersion
+
+# Patch service unit for timeouts and gating ExecStartPost
+$ServiceUnit = Patch-ServiceUnit $ServiceRaw
+
+# Drop-in content
+if (Test-Path $dropinPath) {
+  $DropinUnit = Load-FileOrDie $dropinPath 'kubelet attestation drop-in'
+} else {
+  $DropinUnit = @"
+[Unit]
+After=attest.service
+"@
+}
+
+# Ensure we never keep Requires=attest.service in drop-in
+$DropinUnit = [Regex]::Replace($DropinUnit,'(?m)^Requires=attest\.service\s*','')
+
+# Gating script substitution
+if ($EnableGating) {
+  $GatingScript = $GatingScriptRaw `
+    -replace '__TAINT_KEY__', $TaintKey `
+    -replace '__TAINT_VALUE__', $TaintValue `
+    -replace '__TAINT_EFFECT__', $TaintEffect `
+    -replace '__LABEL_KEY__', $LabelKey `
+    -replace '__LABEL_PASS__', $LabelPassed `
+    -replace '__LABEL_FAIL__', $LabelFailed `
+    -replace '__REQUIRE_FILE__', ($RequireStatusFile ? 'true' : 'false')
+}
+
+$Remote = @'
 #!/usr/bin/env bash
 set -euo pipefail
-export LANG=C
-export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
-export DEBIAN_FRONTEND=noninteractive
 
-# 0) OS prereqs
-if [ -f /etc/os-release ]; then . /etc/os-release; fi
-if printf "%s\n%s\n" "${ID_LIKE:-}" "${ID:-}" | grep -qi mariner; then
-  tdnf makecache -q || true
-  tdnf install -y tpm2-tools jq curl util-linux || true
-else
-  i=0
-  until apt-get update -qq >/dev/null 2>&1 || [ $i -ge 2 ]; do i=$((i+1)); sleep 2; done
-  apt-get install -y --no-install-recommends tpm2-tools jq curl util-linux || true
+MODE="__MODE__"
+VERIFIER_URL="__VERIFIER_URL__"
+CHALLENGE_URL="__CHALLENGE_URL__"
+SKIP_PREREQS="__SKIP_PREREQS__"
+ENABLE_GATING="__ENABLE_GATING__"
+ENABLE_TIMER="__ENABLE_TIMER__"
+
+log(){ echo "[deploy-attest] $(date --iso-8601=seconds) $*" >&2; }
+
+if [[ "$SKIP_PREREQS" != "true" ]]; then
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq || true
+  apt-get install -y --no-install-recommends jq curl tpm2-tools flock util-linux || true
 fi
 
-# 1) Directories
-install -d -m 0755 /opt/azure/containers
-install -d -m 0755 /etc/systemd/system/kubelet.service.d
-install -d -m 0755 /etc/default
-install -d -m 0700 /var/lib/attest
+install -d -m0755 /opt/azure/containers /etc/systemd/system/kubelet.service.d
 
-# 2) Write artifacts
-printf '%s' '__ATTEST_B64__' | base64 -d > /opt/azure/containers/attest.sh
-printf '%s' '__UNIT_B64__'   | base64 -d > /etc/systemd/system/attest.service
-printf '%s' '__DROP_B64__'   | base64 -d > /etc/systemd/system/kubelet.service.d/10-attestation.conf
-
-# Normalize endings
-sed -i 's/\r$//' /opt/azure/containers/attest.sh /etc/systemd/system/attest.service /etc/systemd/system/kubelet.service.d/10-attestation.conf
-
+cat > /opt/azure/containers/attest.sh <<'ATT'
+__ATTEST_SH__
+ATT
 chmod 0755 /opt/azure/containers/attest.sh
-chmod 0644 /etc/systemd/system/attest.service /etc/systemd/system/kubelet.service.d/10-attestation.conf
 
-# 3) Light guardrails
-# If your unit accidentally has StartLimit* under [Service], move them to [Unit] server-side
-if grep -q '^StartLimitIntervalSec=' /etc/systemd/system/attest.service; then
-  sed -i '/^\[Service\]/,/^\[/{/^StartLimitIntervalSec=/d;/^StartLimitBurst=/d}' /etc/systemd/system/attest.service
+cat > /etc/default/attest <<ENV
+MODE=$MODE
+VERIFIER_URL=$VERIFIER_URL
+CHALLENGE_URL=$CHALLENGE_URL
+REQUIRE_TPM=true
+REQUIRE_SECURE_BOOT=true
+PCRS=0,7,11
+ENV
+
+cat > /etc/systemd/system/attest.service <<'UNIT'
+__SERVICE_UNIT__
+UNIT
+
+DROPIN=/etc/systemd/system/kubelet.service.d/10-attestation.conf
+cat > "$DROPIN" <<'DUNIT'
+__DROPIN_UNIT__
+DUNIT
+sed -i '/^Requires=attest.service/d' "$DROPIN"
+
+if [[ "$ENABLE_GATING" == "true" ]]; then
+  cat > /usr/local/bin/attest-gating.sh <<'GATE'
+__GATING_SCRIPT__
+GATE
+  chmod 0755 /usr/local/bin/attest-gating.sh
+
+  if [[ "$ENABLE_TIMER" == "true" ]]; then
+    cat > /etc/systemd/system/attest-gating.timer <<'TIMER'
+[Unit]
+Description=Periodic attestation gating refresh
+[Timer]
+OnBootSec=5m
+OnUnitActiveSec=10m
+Unit=attest-gating-refresh.service
+[Install]
+WantedBy=timers.target
+TIMER
+    cat > /etc/systemd/system/attest-gating-refresh.service <<'REFRESH'
+[Unit]
+Description=Re-apply attestation gating
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/attest-gating.sh
+REFRESH
+  fi
 fi
-# Ensure kubelet drop-in has a [Unit] header and contains only After=attest.service
-if ! head -n1 /etc/systemd/system/kubelet.service.d/10-attestation.conf | grep -q '^\[Unit\]'; then
-  sed -i '1s;^;[Unit]\n;' /etc/systemd/system/kubelet.service.d/10-attestation.conf
-fi
-sed -i '/^Requires=attest\.service/d' /etc/systemd/system/kubelet.service.d/10-attestation.conf
-grep -q '^After=attest\.service' /etc/systemd/system/kubelet.service.d/10-attestation.conf || echo 'After=attest.service' >> /etc/systemd/system/kubelet.service.d/10-attestation.conf
 
-# 4) Defaults file presence
-[ -f /etc/default/attest ] || printf 'MODE=AUTO\n' > /etc/default/attest
-
-# 5) Reload and restart
 systemctl daemon-reload
 systemctl enable attest.service >/dev/null 2>&1 || true
 systemctl reset-failed attest.service || true
 systemctl restart attest.service || true
 systemctl restart kubelet.service || true
+if [[ "$ENABLE_GATING" == "true" && "$ENABLE_TIMER" == "true" ]]; then
+  systemctl enable --now attest-gating.timer || true
+fi
 
-# 6) Summary
-echo '== attest.service status =='
-systemctl show attest.service -p ActiveState -p Result -p FragmentPath
-echo '== kubelet Requires/After =='
-systemctl show kubelet -p Requires -p After
-echo '== attest.service head =='
-sed -n '1,40p' /etc/systemd/system/attest.service || true
-echo '== status.json (first 200 chars) =='
-[ -f /var/lib/attest/status.json ] && sed -n '1,200p' /var/lib/attest/status.json || echo '(missing)'
+echo "== attest.service status =="
+systemctl show attest.service -p ActiveState -p Result
+echo "== kubelet drop-in =="
+sed -n '1,25p' "$DROPIN"
+echo "== status.json (first 160 chars) =="
+[ -f /var/lib/attest/status.json ] && sed -n '1,160p' /var/lib/attest/status.json || echo "(missing)"
 '@
 
-$remoteScript = $remoteTemplate.
-  Replace('__ATTEST_B64__', $AttestB64).
-  Replace('__UNIT_B64__',   $UnitB64).
-  Replace('__DROP_B64__',   $DropB64)
+# Safe sequential replacements
+$Remote = $Remote.Replace('__MODE__', $Mode)
+$Remote = $Remote.Replace('__VERIFIER_URL__', $VerifierUrl)
+$Remote = $Remote.Replace('__CHALLENGE_URL__', $ChallengeUrl)
+$Remote = $Remote.Replace('__SKIP_PREREQS__', ($SkipPrereqs ? 'true' : 'false'))
+$Remote = $Remote.Replace('__ENABLE_GATING__', ($EnableGating ? 'true' : 'false'))
+$Remote = $Remote.Replace('__ENABLE_TIMER__', ($EnableGatingRefreshTimer ? 'true' : 'false'))
+$Remote = $Remote.Replace('__ATTEST_SH__', $AttestScript)
+$Remote = $Remote.Replace('__SERVICE_UNIT__', $ServiceUnit)
+$Remote = $Remote.Replace('__DROPIN_UNIT__', $DropinUnit)
 
-if ($VerboseRemote) {
-  Write-Host "---- Remote Script (preview) ----"
-  Write-Host $remoteScript
-  Write-Host "---- End Remote Script ----"
+if ($EnableGating) {
+  $Remote = $Remote.Replace('__GATING_SCRIPT__', $GatingScript)
+} else {
+  $Remote = $Remote.Replace('__GATING_SCRIPT__', '')
 }
 
-# Send as @file to avoid quoting issues
-$RemotePath = [System.IO.Path]::GetTempFileName().Replace(".tmp",".sh")
-Set-Content -Path $RemotePath -Value $remoteScript -Encoding UTF8
+$Temp = [IO.Path]::GetTempFileName().Replace('.tmp','.sh')
+[IO.File]::WriteAllText($Temp, ($Remote -replace "`r`n","`n"), [Text.UTF8Encoding]::UTF8)
 
-Write-Host "Invoking RunCommand with @file (VMSS=$VMSS InstanceID=$IID)..."
-$run = az vmss run-command invoke -g $NodeRG -n $VMSS --instance-id $IID `
-  --command-id RunShellScript --scripts "@$RemotePath" | ConvertFrom-Json
-
-Remove-Item -Force $RemotePath -ErrorAction SilentlyContinue
-
-if ($run.value) {
-  $entry = $run.value[0]
-  Write-Host "Provisioning Status: $($entry.displayStatus)"
-  if ($entry.message) {
-    Write-Host "---- Remote Output ----"
-    Write-Host $entry.message
-  } else {
-    Write-Warning "No message returned from RunCommand."
-  }
-} else {
-  Write-Warning "Unexpected RunCommand response format."
+try {
+  Write-Host "Invoking RunCommand (VMSS=$($info.Vmss) IID=$($info.InstanceId))..."
+  $resp = az vmss run-command invoke -g $info.NodeResourceGroup -n $info.Vmss `
+    --instance-id $info.InstanceId --command-id RunShellScript --scripts "@$Temp"
+  $resp
+} finally {
+  Remove-Item -Force $Temp
 }
 
 Write-Host "Completed attestation push for node: $NodeName"
