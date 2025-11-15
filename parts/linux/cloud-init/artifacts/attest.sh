@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 umask 027
-
 export LANG=C
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 
-# Prefer /dev/tpmrm0 then fall back to /dev/tpm0
+# Prefer /dev/tpmrm0 then fall back to /dev/tpm0 (restored)
 if [[ -c /dev/tpmrm0 ]]; then
   export TPM2TOOLS_TCTI="device:/dev/tpmrm0"
 elif [[ -c /dev/tpm0 ]]; then
@@ -30,6 +29,8 @@ fi
 : "${TPM_HASH_ALG:=sha256}"
 : "${SCHEMA_VERSION:=1}"
 : "${POLICY_HASH:=}"
+: "${MODE:=AUTO}"             # AUTO|VERIFY|STUB|MOCK
+: "${VERSION:=2025.11.14}"    # stamp for traceability
 
 # ========= Exit codes (must match systemd RestartPreventExitStatus) =========
 readonly EXIT_SUCCESS=0
@@ -45,6 +46,26 @@ log(){ echo "[attest] $(date --iso-8601=seconds) $*" | tee -a "$LOG" >&2 ; }
 wstatus(){ printf '%s\n' "$1" > "$STATUS_FILE"; chmod 600 "$STATUS_FILE"; }
 need(){ command -v "$1" >/dev/null 2>&1 || { log "FATAL: $1 missing"; wstatus "{\"status\":\"failed\",\"reason\":\"${1}Missing\"}"; exit "$EXIT_PERMANENT_FAILURE"; }; }
 b64(){ base64 -w0 "$1" 2>/dev/null || base64 "$1"; }
+
+# ========= Mock mode detection =========
+is_loopback_pair() {
+  [[ -n "${CHALLENGE_URL}" && -n "${VERIFIER_URL}" ]] \
+    && [[ "${CHALLENGE_URL}" =~ ^http://127\.0\.0\.1: ]] \
+    && [[ "${VERIFIER_URL}" =~ ^http://127\.0\.0\.1: ]]
+}
+
+preflight_mock() {
+  local ok=0
+  curl -fsS --max-time 2 "${CHALLENGE_URL}" >/dev/null 2>&1 || ok=1
+  curl -fsS --max-time 2 -X POST "${VERIFIER_URL}" >/dev/null 2>&1 || ok=$(( ok + 2 ))
+  case $ok in
+    0) log "Mock endpoints reachable" ;;
+    1) log "Mock challenge endpoint unreachable"; return 1 ;;
+    2) log "Mock verify endpoint unreachable"; return 1 ;;
+    3) log "Both mock endpoints unreachable"; return 1 ;;
+  esac
+  return 0
+}
 
 # ========= Identity (prefer IMDS) =========
 fetch_imds(){ curl -sS --fail --max-time 2 -H "Metadata:true" "http://169.254.169.254/metadata/instance?api-version=2021-02-01" || true; }
@@ -80,7 +101,8 @@ detect_ak_handle(){
       log "Using provided AK handle: $AK_HANDLE"
       echo "$AK_HANDLE"; return 0
     else
-      log "Provided AK_HANDLE malformed: $AK_HANDLE"; return 1
+      log "Provided AK_HANDLE malformed: $AK_HANDLE"
+      return 1
     fi
   fi
   if command -v tpm2_getcap >/dev/null 2>&1; then
@@ -92,7 +114,7 @@ detect_ak_handle(){
       fi
     done < <(tpm2_getcap handles-persistent 2>/dev/null | grep -Eo '0x[0-9a-fA-F]+')
   fi
-  log "No persistent AK, creating ephemeral AK"
+  log "No persistent AK found, creating ephemeral AK"
   tpm2_createek -G rsa -u "$STATE_DIR/ek.pub" -c "$STATE_DIR/ek.ctx" >/dev/null 2>&1 || { log "Failed to create EK"; return 1; }
   tpm2_createak -G ecc -g "$TPM_HASH_ALG" -s ecdsa -C "$STATE_DIR/ek.ctx" \
     -u "$STATE_DIR/ak.pub" -c "$STATE_DIR/ak.ctx" -n "$STATE_DIR/ak.name" >/dev/null 2>&1 || { log "Failed to create AK"; return 1; }
@@ -100,15 +122,18 @@ detect_ak_handle(){
   echo "$STATE_DIR/ak.ctx"
 }
 
+quote_timeout_secs() { if [[ "$MODE" == "MOCK" ]]; then echo 10; else echo 20; fi; }
+
 perform_quote(){
   local ak="$1" nonce="$2"
   local qmsg="$STATE_DIR/quote.msg" qsig="$STATE_DIR/quote.sig" qpcr="$STATE_DIR/quote.pcrs"
   if [[ "$ak" =~ ^0x[0-9a-fA-F]+$ || -f "$ak" ]]; then :; else
     log "AK handle/context invalid: $ak"; return 1
   fi
-  if ! timeout 15s tpm2_quote -c "$ak" -l "${TPM_HASH_ALG}:${PCRS}" -q "$nonce" \
+  local QT; QT="$(quote_timeout_secs)"
+  if ! timeout "${QT}s" tpm2_quote -c "$ak" -l "${TPM_HASH_ALG}:${PCRS}" -q "$nonce" \
        -m "$qmsg" -s "$qsig" -o "$qpcr" >/dev/null 2>&1; then
-    log "tpm2_quote command failed"; return 1
+    log "tpm2_quote command failed (timeout=${QT}s)"; return 1
   fi
   local ak_pub="" ak_name=""
   [[ -f "$STATE_DIR/ak.pub"  ]] && ak_pub="$(b64 "$STATE_DIR/ak.pub")"
@@ -134,27 +159,42 @@ fetch_nonce(){
     fi
     nonce="$(echo "$resp" | jq -r '.nonce // empty' 2>/dev/null || true)"
     [[ -n "$nonce" && "$nonce" != "null" ]] || { log "No valid nonce in challenge response"; return 1; }
-    log "Fetched nonce from challenge service"
-    echo "$nonce"; return 0
+    log "Fetched nonce from challenge service"; echo "$nonce"; return 0
   fi
-  if command -v openssl >/dev/null 2>&1; then
-    log "Using random nonce from openssl"
-    openssl rand -hex 16
-  else
-    log "Using random nonce from xxd"
+  if command -v xxd >/dev/null 2>&1; then
     head -c 16 /dev/urandom | xxd -p | tr -d '\n'
+  else
+    openssl rand -hex 16 2>/dev/null | tr -d '\n'
   fi
 }
 
 verify_remote(){
   local payload="$1"
-  if [[ -z "$VERIFIER_URL" ]]; then
-    log "No VERIFIER_URL set, stub PASS"
-    jq -n --arg at "$(date --iso-8601=seconds)" '{ok:true,verifier:"stub",at:$at}'
-    return 0
-  fi
-  curl -sS --fail --max-time "$CURL_TIMEOUT" --connect-timeout 3 --retry 2 --retry-delay 2 \
-       -H 'Content-Type: application/json' -d "$payload" "$VERIFIER_URL" 2>/dev/null || { log "Verifier request failed"; return 1; }
+  # MODE semantics
+  case "$MODE" in
+    STUB)
+      log "MODE=STUB: returning stub PASS"
+      jq -n --arg at "$(date --iso-8601=seconds)" '{ok:true,verifier:"stub",at:$at}'
+      return 0
+      ;;
+    MOCK|AUTO|VERIFY)
+      if [[ -z "$VERIFIER_URL" ]]; then
+        if [[ "$MODE" == "VERIFY" ]]; then
+          log "MODE=VERIFY but VERIFIER_URL unset"
+          return 1
+        fi
+        log "No VERIFIER_URL set, stub PASS"
+        jq -n --arg at "$(date --iso-8601=seconds)" '{ok:true,verifier:"stub",at:$at}'
+        return 0
+      fi
+      curl -sS --fail --max-time "$CURL_TIMEOUT" --connect-timeout 3 --retry 2 --retry-delay 2 \
+        -H 'Content-Type: application/json' -d "$payload" "$VERIFIER_URL" 2>/dev/null || { log "Verifier request failed"; return 1; }
+      ;;
+    *)
+      log "Unknown MODE=$MODE"
+      return 1
+      ;;
+  esac
 }
 
 single_instance_lock(){ exec 200>"$STATE_DIR/.lock"; flock -n 200 || { log "Another instance running"; exit "$EXIT_TRANSIENT_FAILURE"; }; }
@@ -168,13 +208,45 @@ sleep_backoff(){
 }
 
 main(){
-  log "=== Attestation starting (PID=$$) ==="
+  log "=== Attestation starting (PID=$$, MODE=$MODE, VERSION=$VERSION) ==="
+  # Auto-promote to MOCK if loopback endpoints present and MODE is AUTO
+  if [[ "$MODE" == "AUTO" && "$(is_loopback_pair && echo yes || echo no)" == "yes" ]]; then
+    MODE="MOCK"
+    log "Auto-detected loopback endpoints; switching MODE=MOCK"
+  fi
+
   single_instance_lock
+
+  # STUB mode short-circuit (no TPM work)
+  if [[ "$MODE" == "STUB" ]]; then
+    local stubOut
+    stubOut="$(jq -n --arg ver "$SCHEMA_VERSION" --arg policy "$POLICY_HASH" \
+      --arg version "$VERSION" '{version:$ver,policy:$policy,implVersion:$version,status:"passed",quote:null,verdict:{ok:true,verifier:"stub"}}')"
+    wstatus "$stubOut"
+    log "=== Attestation PASSED (STUB) ==="
+    exit "$EXIT_SUCCESS"
+  fi
 
   # Prereqs
   need jq; need curl; need timeout; need flock
   need tpm2_quote; need tpm2_createek; need tpm2_createak; need tpm2_readpublic
-  command -v xxd >/dev/null 2>&1 || command -v openssl >/dev/null 2>&1 || { log "FATAL: need xxd or openssl"; wstatus '{"status":"failed","reason":"entropyToolMissing"}'; exit "$EXIT_PERMANENT_FAILURE"; }
+  command -v xxd >/dev/null 2>&1 || command -v openssl >/dev/null 2>&1 || {
+    log "FATAL: need xxd or openssl for entropy"
+    wstatus '{"status":"failed","reason":"entropyToolMissing"}'
+    exit "$EXIT_PERMANENT_FAILURE"
+  }
+
+  # Mock preflight
+  if [[ "$MODE" == "MOCK" ]]; then
+    if ! preflight_mock; then
+      wstatus '{"status":"pending","reason":"mockServerNotReady"}'
+      exit "$EXIT_TRANSIENT_FAILURE"
+    fi
+    if [[ "$RETRY_MAX" -gt 8 ]]; then
+      log "Reducing RETRY_MAX from $RETRY_MAX to 8 for MOCK mode"
+      RETRY_MAX=8
+    fi
+  fi
 
   # TPM presence
   if [[ "$REQUIRE_TPM" == "true" ]]; then
@@ -186,15 +258,19 @@ main(){
     log "TPM device detected"
   fi
   if [[ ! -c /dev/tpmrm0 && -c /dev/tpm0 ]]; then
-    log "Warning, /dev/tpmrm0 missing, using /dev/tpm0"
+    log "Warning: /dev/tpmrm0 missing, using /dev/tpm0"
   fi
 
   # Secure Boot
   if [[ "$REQUIRE_SECURE_BOOT" == "true" ]]; then
-    sb_code=0; secure_boot_enabled || sb_code=$?
+    local sb_code=0; secure_boot_enabled || sb_code=$?
     case "$sb_code" in
       0) log "Secure Boot: ENABLED" ;;
-      1) log "FATAL: Secure Boot DISABLED"; wstatus '{"status":"failed","reason":"secureBootDisabled"}'; exit "$EXIT_PERMANENT_FAILURE" ;;
+      1)
+        log "FATAL: Secure Boot DISABLED"
+        wstatus '{"status":"failed","reason":"secureBootDisabled"}'
+        exit "$EXIT_PERMANENT_FAILURE"
+        ;;
       2)
         if [[ ! -f "$STATE_DIR/.sb_checked_once" ]]; then
           log "Secure Boot unknown, will retry once"
@@ -213,12 +289,15 @@ main(){
   # Acquire AK
   local ak
   if ! ak="$(detect_ak_handle)"; then
-    log "Unable to obtain AK (initial)"; wstatus '{"status":"failed","reason":"akUnavailable"}'; exit "$EXIT_TRANSIENT_FAILURE"
+    log "Unable to obtain AK (initial)"
+    wstatus '{"status":"failed","reason":"akUnavailable"}'
+    exit "$EXIT_TRANSIENT_FAILURE"
   fi
   ak="$(printf '%s' "$ak" | tr -d '\r\n\t ')"
   log "AK ready: $ak"
 
   # Retry loop
+  local attempt
   for attempt in $(seq 1 "$RETRY_MAX"); do
     log "--- Attempt $attempt/$RETRY_MAX ---"
     local nonce
@@ -256,17 +335,16 @@ main(){
         wstatus '{"status":"failed","reason":"subjectMismatch"}'
         exit "$EXIT_TRANSIENT_FAILURE"
       fi
+      local token; token="$(echo "$verdict" | jq -r '.token // empty' 2>/dev/null || true)"
       local combined
       combined="$(jq -n \
         --arg ver "$SCHEMA_VERSION" \
         --arg policy "$POLICY_HASH" \
+        --arg version "$VERSION" \
         --argjson quote "$quote_json" \
         --argjson verdict "$verdict" \
-        '{version:$ver,policy:$policy,status:"passed",quote:$quote,verdict:$verdict}')"
+        '{version:$ver,policy:$policy,implVersion:$version,status:"passed",quote:$quote,verdict:$verdict}')"
       wstatus "$combined"
-      # write token only if non-empty
-      local token
-      token="$(echo "$verdict" | jq -r '.token // empty' 2>/dev/null || true)"
       if [[ -n "$token" ]]; then
         printf '%s\n' "$token" > "$TOKEN_FILE"
         chmod 600 "$TOKEN_FILE" 2>/dev/null || true
@@ -283,7 +361,8 @@ main(){
   done
 
   log "Exhausted retries"
-  wstatus '{"status":"failed","reason":"maxRetries"}'
+  wstatus "$(jq -n --arg ver "$SCHEMA_VERSION" --arg version "$VERSION" --arg policy "$POLICY_HASH" --arg attempts "$RETRY_MAX" \
+    '{version:$ver,policy:$policy,implVersion:$version,status:"failed",reason:"maxRetries",attempts:($attempts|tonumber)}')"
   exit "$EXIT_TRANSIENT_FAILURE"
 }
 

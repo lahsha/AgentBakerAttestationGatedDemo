@@ -2,14 +2,13 @@
   push-attest.ps1
   Push attestation artifacts to a single AKS VMSS instance, install deps, enable the gate, and restart kubelet.
 
-  Highlights:
-    - Resolves nodeResourceGroup, parses providerID to VMSS + Instance
-    - Base64 transports local artifacts safely via RunCommand
-    - Optional fallback attestation script if local script is missing (unless -RequireLocalScript)
-    - Normalizes endings, sets permissions, installs tpm2-tools jq curl
-    - Hardens the unit if needed (Type=oneshot, RemainAfterExit=yes, TimeoutStartSec=300)
+  Artifacts used from your repo (relative to this script):
+    - ./attest.sh
+    - ./attest.service
+    - ./kubelet.service.d/10-attestation.conf
 #>
 
+[CmdletBinding()]
 param(
   [Parameter(Mandatory = $true)] [string] $AksResourceGroup,
   [Parameter(Mandatory = $true)] [string] $ClusterName,
@@ -26,44 +25,6 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-# Fallback attestation script (very small PASS/AUTO behavior)
-$FallbackAttest = @'
-#!/bin/bash
-set -euo pipefail
-STATUS_DIR=/var/lib/attest
-mkdir -p "$STATUS_DIR"
-
-MODE="PASS"
-[ -f /etc/default/attest ] && source /etc/default/attest || true
-
-secure_boot="unknown"
-if command -v mokutil >/dev/null 2>&1; then
-  mokutil --sb-state 2>/dev/null | grep -qi enabled && secure_boot="enabled" || secure_boot="disabled"
-elif command -v bootctl >/dev/null 2>&1; then
-  bootctl status 2>/dev/null | grep -qi 'Secure Boot: enabled' && secure_boot="enabled" || secure_boot="disabled"
-fi
-
-tpm_state="absent"
-[ -e /dev/tpmrm0 ] || [ -e /dev/tpm0 ] && tpm_state="present"
-
-if [ "$MODE" = "AUTO" ]; then
-  if [ "$tpm_state" = "present" ]; then MODE="PASS"; else MODE="FAIL"; fi
-fi
-
-rc=0
-[ "$MODE" = "FAIL" ] && rc=10
-
-cat > "$STATUS_DIR/status.json" <<EOF
-{"timestamp":"$(date -Iseconds)","secure_boot":"$secure_boot","tpm_state":"$tpm_state","verdict":"$MODE","source":"fallback-inline"}
-EOF
-printf '%s\n' "$MODE" > "$STATUS_DIR/verdict.jwt"
-echo "attestation_mode=$MODE"
-echo "secure_boot=$secure_boot"
-echo "tpm_state=$tpm_state"
-echo "exit_code=$rc"
-exit $rc
-'@
-
 function Read-LFOrFallback {
   param(
     [Parameter(Mandatory)] [string] $Path,
@@ -72,14 +33,15 @@ function Read-LFOrFallback {
     [switch] $IsScript
   )
   if (Test-Path -LiteralPath $Path) {
+    # Normalize CRLF to LF for remote
     (Get-Content -Raw -LiteralPath $Path) -replace "`r`n","`n" -replace "`r","`n"
   } else {
     if ($Mandatory) { throw "Missing mandatory local file: $Path" }
     if ($IsScript) {
-      Write-Warning "Local attestation script not found, will use fallback."
-      return $Fallback
+      if ($Fallback) { return $Fallback }
+      throw "Local script missing and no fallback provided: $Path"
     }
-    throw "Fallback given for a non-script file: $Path"
+    throw "Missing file: $Path"
   }
 }
 
@@ -97,88 +59,83 @@ $VMSS = $Match.Groups[1].Value
 $IID  = $Match.Groups[2].Value
 Write-Host "Target => NodeRG=$NodeRG VMSS=$VMSS IID=$IID"
 
-# Load artifacts
-$AttestRaw = Read-LFOrFallback -Path $AttestLocal -Fallback $FallbackAttest -IsScript -Mandatory:$RequireLocalScript
+# Load artifacts strictly from repo
+$AttestRaw = Read-LFOrFallback -Path $AttestLocal -Mandatory:$RequireLocalScript -IsScript
 $UnitRaw   = Read-LFOrFallback -Path $UnitLocal   -Mandatory
 $DropRaw   = Read-LFOrFallback -Path $DropInLocal -Mandatory
 
-# Encode artifacts
+# Encode artifacts for transport
 $AttestB64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($AttestRaw))
 $UnitB64   = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($UnitRaw))
 $DropB64   = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($DropRaw))
 
-# Remote script as single-quoted template with placeholders
+# Remote script with small guardrails
 $remoteTemplate = @'
-#!/bin/sh
-set -eu
+#!/usr/bin/env bash
+set -euo pipefail
+export LANG=C
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export DEBIAN_FRONTEND=noninteractive
 
-# Install minimal deps
+# 0) OS prereqs
 if [ -f /etc/os-release ]; then . /etc/os-release; fi
-if printf "%s" "${ID_LIKE:-}\n${ID:-}" | grep -qi mariner; then
+if printf "%s\n%s\n" "${ID_LIKE:-}" "${ID:-}" | grep -qi mariner; then
   tdnf makecache -q || true
-  tdnf install -y tpm2-tools jq curl || true
+  tdnf install -y tpm2-tools jq curl util-linux || true
 else
   i=0
-  until apt-get update -qq >/dev/null 2>&1 || [ $i -ge 2 ]; do
-    i=$((i+1)); sleep 2
-  done
-  apt-get install -y --no-install-recommends tpm2-tools jq curl || true
+  until apt-get update -qq >/dev/null 2>&1 || [ $i -ge 2 ]; do i=$((i+1)); sleep 2; done
+  apt-get install -y --no-install-recommends tpm2-tools jq curl util-linux || true
 fi
 
-# Ensure directories
+# 1) Directories
 install -d -m 0755 /opt/azure/containers
 install -d -m 0755 /etc/systemd/system/kubelet.service.d
 install -d -m 0755 /etc/default
 install -d -m 0700 /var/lib/attest
 
-# Lay down artifacts
+# 2) Write artifacts
 printf '%s' '__ATTEST_B64__' | base64 -d > /opt/azure/containers/attest.sh
 printf '%s' '__UNIT_B64__'   | base64 -d > /etc/systemd/system/attest.service
 printf '%s' '__DROP_B64__'   | base64 -d > /etc/systemd/system/kubelet.service.d/10-attestation.conf
 
-# Normalize endings and perms
+# Normalize endings
 sed -i 's/\r$//' /opt/azure/containers/attest.sh /etc/systemd/system/attest.service /etc/systemd/system/kubelet.service.d/10-attestation.conf
+
 chmod 0755 /opt/azure/containers/attest.sh
 chmod 0644 /etc/systemd/system/attest.service /etc/systemd/system/kubelet.service.d/10-attestation.conf
 
-# Seed defaults if absent
-if [ ! -s /etc/default/attest ]; then
-  printf 'MODE=AUTO\nCHALLENGE_URL=\n' > /etc/default/attest
+# 3) Light guardrails
+# If your unit accidentally has StartLimit* under [Service], move them to [Unit] server-side
+if grep -q '^StartLimitIntervalSec=' /etc/systemd/system/attest.service; then
+  sed -i '/^\[Service\]/,/^\[/{/^StartLimitIntervalSec=/d;/^StartLimitBurst=/d}' /etc/systemd/system/attest.service
 fi
+# Ensure kubelet drop-in has a [Unit] header and contains only After=attest.service
+if ! head -n1 /etc/systemd/system/kubelet.service.d/10-attestation.conf | grep -q '^\[Unit\]'; then
+  sed -i '1s;^;[Unit]\n;' /etc/systemd/system/kubelet.service.d/10-attestation.conf
+fi
+sed -i '/^Requires=attest\.service/d' /etc/systemd/system/kubelet.service.d/10-attestation.conf
+grep -q '^After=attest\.service' /etc/systemd/system/kubelet.service.d/10-attestation.conf || echo 'After=attest.service' >> /etc/systemd/system/kubelet.service.d/10-attestation.conf
 
-# Harden the unit if caller forgot
-if ! grep -q '^Type=' /etc/systemd/system/attest.service; then
-  sed -i '/^\[Service\]/a Type=oneshot' /etc/systemd/system/attest.service
-fi
-if ! grep -q '^RemainAfterExit=' /etc/systemd/system/attest.service; then
-  sed -i '/^\[Service\]/a RemainAfterExit=yes' /etc/systemd/system/attest.service
-fi
-if ! grep -q '^TimeoutStartSec=' /etc/systemd/system/attest.service; then
-  sed -i '/^\[Service\]/a TimeoutStartSec=300' /etc/systemd/system/attest.service
-fi
+# 4) Defaults file presence
+[ -f /etc/default/attest ] || printf 'MODE=AUTO\n' > /etc/default/attest
 
+# 5) Reload and restart
 systemctl daemon-reload
-systemctl enable attest.service
+systemctl enable attest.service >/dev/null 2>&1 || true
 systemctl reset-failed attest.service || true
-systemctl start attest.service || true
-
-# Apply kubelet drop-in now
+systemctl restart attest.service || true
 systemctl restart kubelet.service || true
 
-# Summaries
+# 6) Summary
 echo '== attest.service status =='
-systemctl --no-pager -l status attest.service || true
+systemctl show attest.service -p ActiveState -p Result -p FragmentPath
 echo '== kubelet Requires/After =='
-systemctl show kubelet -p Requires -p After || true
-echo '== files =='
-ls -l /opt/azure/containers/attest.sh || true
-head -n 20 /etc/systemd/system/attest.service || true
-echo '== kubelet drop-in =='
-sed -n '1,60p' /etc/systemd/system/kubelet.service.d/10-attestation.conf || true
-echo '== attestation state =='
-ls -l /var/lib/attest 2>/dev/null || true
-[ -f /var/lib/attest/status.json ] && sed -n '1,80p' /var/lib/attest/status.json || true
+systemctl show kubelet -p Requires -p After
+echo '== attest.service head =='
+sed -n '1,40p' /etc/systemd/system/attest.service || true
+echo '== status.json (first 200 chars) =='
+[ -f /var/lib/attest/status.json ] && sed -n '1,200p' /var/lib/attest/status.json || echo '(missing)'
 '@
 
 $remoteScript = $remoteTemplate.
@@ -192,7 +149,7 @@ if ($VerboseRemote) {
   Write-Host "---- End Remote Script ----"
 }
 
-# Write remote script to temp file to avoid quoting limits
+# Send as @file to avoid quoting issues
 $RemotePath = [System.IO.Path]::GetTempFileName().Replace(".tmp",".sh")
 Set-Content -Path $RemotePath -Value $remoteScript -Encoding UTF8
 
