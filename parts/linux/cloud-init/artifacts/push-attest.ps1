@@ -9,15 +9,6 @@ param(
   [switch]$SkipPrereqs,
   [int]$TimeoutStartSec = 120,
   [int]$RestartSec = 20,
-  [switch]$EnableGating,
-  [switch]$EnableGatingRefreshTimer,
-  [string]$TaintKey='attest',
-  [string]$TaintValue='failed',
-  [string]$TaintEffect='NoSchedule',
-  [string]$LabelKey='attestation',
-  [string]$LabelPassed='passed',
-  [string]$LabelFailed='failed',
-  [switch]$RequireStatusFile,
   [string]$ScriptVersion='2025.11.15',
   [string]$ArtifactsDir = "$(Split-Path -Parent $PSCommandPath)"
 )
@@ -28,11 +19,14 @@ function Resolve-NodeIdentity {
   Write-Host "Resolving nodeResourceGroup..."
   $nodeRG = az aks show -g $AksResourceGroup -n $ClusterName --query nodeResourceGroup -o tsv
   if (-not $nodeRG) { throw "Could not resolve nodeResourceGroup" }
+
   Write-Host "Fetching providerID for $NodeName..."
   $provId = kubectl get node $NodeName -o jsonpath='{.spec.providerID}' 2>$null
   if (-not $provId) { throw "Could not get providerID for $NodeName" }
+
   $m = [Regex]::Match($provId,'virtualMachineScaleSets/([^/]+)/virtualMachines/([^/]+)')
   if (-not $m.Success) { throw "Could not parse providerID '$provId'" }
+
   @{
     NodeResourceGroup = $nodeRG
     Vmss       = $m.Groups[1].Value
@@ -69,22 +63,8 @@ function Patch-ServiceUnit([string]$Content) {
     $Content = $Content -replace '(?m)^\[Service\]',"[Service]`nRestartSec=$RestartSec"
   }
 
-  # ExecStartPost gating (inject if enabled)
-  if ($EnableGating) {
-    if ($Content -notmatch '(?m)^ExecStartPost=/usr/local/bin/attest-gating\.sh') {
-      # Place after existing ExecStart line if present, else append at end of [Service]
-      if ($Content -match '(?m)^ExecStart=') {
-        $Content = $Content -replace '(?m)^ExecStart=.*$',{
-          $_ + "`nExecStartPost=/usr/local/bin/attest-gating.sh"
-        }
-      } else {
-        $Content = $Content -replace '(?m)^\[Service\]',"[Service]`nExecStartPost=/usr/local/bin/attest-gating.sh"
-      }
-    }
-  } else {
-    # If gating disabled, strip any lingering ExecStartPost line referencing attest-gating
-    $Content = [Regex]::Replace($Content,'(?m)^ExecStartPost=/usr/local/bin/attest-gating\.sh\s*','')
-  }
+  # Remove any old ExecStartPost for tainting if present
+  $Content = [Regex]::Replace($Content,'(?m)^ExecStartPost=/usr/local/bin/attest-gating\.sh\s*','')
 
   return $Content
 }
@@ -92,55 +72,49 @@ function Patch-ServiceUnit([string]$Content) {
 $info = Resolve-NodeIdentity
 Write-Host "Target => NodeRG=$($info.NodeResourceGroup) VMSS=$($info.Vmss) IID=$($info.InstanceId)"
 
-# Paths (no templates now)
+# Local artifact paths
 $attestScriptPath  = Join-Path $ArtifactsDir 'attest.sh'
 $servicePath       = Join-Path $ArtifactsDir 'attest.service'
-$gatingScriptPath  = Join-Path $ArtifactsDir 'attest-gating.sh'
-$dropinPath        = Join-Path $ArtifactsDir 'kubelet.attestation.dropin'   # optional plain file
+$dropinPath        = Join-Path $ArtifactsDir 'kubelet.service.d/10-attestation.conf'   # optional override
 
+# Load and prepare contents
 $AttestScriptRaw = Load-FileOrDie $attestScriptPath 'attest.sh'
 $ServiceRaw      = Load-FileOrDie $servicePath 'attest.service'
 
-$GatingScriptRaw = $null
-if ($EnableGating) {
-  if (Test-Path $gatingScriptPath) {
-    $GatingScriptRaw = Load-FileOrDie $gatingScriptPath 'attest-gating.sh'
-  } else {
-    throw "Gating requested but gating script not found at $gatingScriptPath"
-  }
-}
-
-# Version placeholder in attest.sh
+# Stamp script version placeholder if present
 $AttestScript = $AttestScriptRaw -replace '__SCRIPT_VERSION__', $ScriptVersion
 
-# Patch service unit for timeouts and gating ExecStartPost
+# Patch service unit
 $ServiceUnit = Patch-ServiceUnit $ServiceRaw
 
-# Drop-in content
+# Load drop-in or use default gating drop-in
 if (Test-Path $dropinPath) {
   $DropinUnit = Load-FileOrDie $dropinPath 'kubelet attestation drop-in'
 } else {
   $DropinUnit = @"
 [Unit]
+Requires=attest.service
 After=attest.service
 "@
 }
 
-# Ensure we never keep Requires=attest.service in drop-in
-$DropinUnit = [Regex]::Replace($DropinUnit,'(?m)^Requires=attest\.service\s*','')
-
-# Gating script substitution
-if ($EnableGating) {
-  $GatingScript = $GatingScriptRaw `
-    -replace '__TAINT_KEY__', $TaintKey `
-    -replace '__TAINT_VALUE__', $TaintValue `
-    -replace '__TAINT_EFFECT__', $TaintEffect `
-    -replace '__LABEL_KEY__', $LabelKey `
-    -replace '__LABEL_PASS__', $LabelPassed `
-    -replace '__LABEL_FAIL__', $LabelFailed `
-    -replace '__REQUIRE_FILE__', ($RequireStatusFile ? 'true' : 'false')
+# Ensure drop-in has Requires and After
+if ($DropinUnit -notmatch '(?m)^Requires=attest\.service\s*$') {
+  if ($DropinUnit -match '(?m)^\[Unit\]') {
+    $DropinUnit = $DropinUnit -replace '(?m)^\[Unit\]',"[Unit]`nRequires=attest.service"
+  } else {
+    $DropinUnit = "[Unit]`nRequires=attest.service`n" + $DropinUnit
+  }
+}
+if ($DropinUnit -notmatch '(?m)^After=attest\.service\s*$') {
+  if ($DropinUnit -match '(?m)^\[Unit\]') {
+    $DropinUnit = $DropinUnit -replace '(?m)^\[Unit\]',"[Unit]`nAfter=attest.service"
+  } else {
+    $DropinUnit = "[Unit]`nAfter=attest.service`n" + $DropinUnit
+  }
 }
 
+# Remote script template, will fill placeholders with raw contents
 $Remote = @'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -149,104 +123,73 @@ MODE="__MODE__"
 VERIFIER_URL="__VERIFIER_URL__"
 CHALLENGE_URL="__CHALLENGE_URL__"
 SKIP_PREREQS="__SKIP_PREREQS__"
-ENABLE_GATING="__ENABLE_GATING__"
-ENABLE_TIMER="__ENABLE_TIMER__"
 
 log(){ echo "[deploy-attest] $(date --iso-8601=seconds) $*" >&2; }
 
 if [[ "$SKIP_PREREQS" != "true" ]]; then
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq || true
-  apt-get install -y --no-install-recommends jq curl tpm2-tools flock util-linux || true
+  # flock binary is provided by util-linux on Ubuntu
+  apt-get install -y --no-install-recommends jq curl tpm2-tools util-linux || true
 fi
 
-install -d -m0755 /opt/azure/containers /etc/systemd/system/kubelet.service.d
+mkdir -p /opt/azure/containers
+mkdir -p /etc/systemd/system/kubelet.service.d
 
-cat > /opt/azure/containers/attest.sh <<'ATT'
+# Install attest.sh
+cat <<'EOF_ATTEST' >/opt/azure/containers/attest.sh
 __ATTEST_SH__
-ATT
-chmod 0755 /opt/azure/containers/attest.sh
+EOF_ATTEST
+chmod +x /opt/azure/containers/attest.sh
 
-cat > /etc/default/attest <<ENV
-MODE=$MODE
-VERIFIER_URL=$VERIFIER_URL
-CHALLENGE_URL=$CHALLENGE_URL
-REQUIRE_TPM=true
-REQUIRE_SECURE_BOOT=true
-PCRS=0,7,11
-ENV
-
-cat > /etc/systemd/system/attest.service <<'UNIT'
+# Install attest.service
+cat <<'EOF_SERVICE' >/etc/systemd/system/attest.service
 __SERVICE_UNIT__
-UNIT
+EOF_SERVICE
 
-DROPIN=/etc/systemd/system/kubelet.service.d/10-attestation.conf
-cat > "$DROPIN" <<'DUNIT'
+# Install kubelet drop-in
+cat <<'EOF_DROPIN' >/etc/systemd/system/kubelet.service.d/10-attestation.conf
 __DROPIN_UNIT__
-DUNIT
-sed -i '/^Requires=attest.service/d' "$DROPIN"
-
-if [[ "$ENABLE_GATING" == "true" ]]; then
-  cat > /usr/local/bin/attest-gating.sh <<'GATE'
-__GATING_SCRIPT__
-GATE
-  chmod 0755 /usr/local/bin/attest-gating.sh
-
-  if [[ "$ENABLE_TIMER" == "true" ]]; then
-    cat > /etc/systemd/system/attest-gating.timer <<'TIMER'
-[Unit]
-Description=Periodic attestation gating refresh
-[Timer]
-OnBootSec=5m
-OnUnitActiveSec=10m
-Unit=attest-gating-refresh.service
-[Install]
-WantedBy=timers.target
-TIMER
-    cat > /etc/systemd/system/attest-gating-refresh.service <<'REFRESH'
-[Unit]
-Description=Re-apply attestation gating
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/attest-gating.sh
-REFRESH
-  fi
-fi
+EOF_DROPIN
 
 systemctl daemon-reload
-systemctl enable attest.service >/dev/null 2>&1 || true
-systemctl reset-failed attest.service || true
-systemctl restart attest.service || true
-systemctl restart kubelet.service || true
-if [[ "$ENABLE_GATING" == "true" && "$ENABLE_TIMER" == "true" ]]; then
-  systemctl enable --now attest-gating.timer || true
+systemctl enable attest.service || true
+
+if ! systemctl restart attest.service; then
+  log "attest.service restart failed"
 fi
 
 echo "== attest.service status =="
-systemctl show attest.service -p ActiveState -p Result
+systemctl show attest.service -p Result -p ActiveState
+
+DROPIN=/etc/systemd/system/kubelet.service.d/10-attestation.conf
 echo "== kubelet drop-in =="
-sed -n '1,25p' "$DROPIN"
+if [ -f "$DROPIN" ]; then
+  sed -n '1,25p' "$DROPIN"
+else
+  echo "(missing)"
+fi
+
 echo "== status.json (first 160 chars) =="
-[ -f /var/lib/attest/status.json ] && sed -n '1,160p' /var/lib/attest/status.json || echo "(missing)"
+if [ -f /var/lib/attest/status.json ]; then
+  sed -n '1,160p' /var/lib/attest/status.json
+else
+  echo "(missing)"
+fi
 '@
 
-# Safe sequential replacements
+# Fill in placeholders
 $Remote = $Remote.Replace('__MODE__', $Mode)
 $Remote = $Remote.Replace('__VERIFIER_URL__', $VerifierUrl)
 $Remote = $Remote.Replace('__CHALLENGE_URL__', $ChallengeUrl)
 $Remote = $Remote.Replace('__SKIP_PREREQS__', ($SkipPrereqs ? 'true' : 'false'))
-$Remote = $Remote.Replace('__ENABLE_GATING__', ($EnableGating ? 'true' : 'false'))
-$Remote = $Remote.Replace('__ENABLE_TIMER__', ($EnableGatingRefreshTimer ? 'true' : 'false'))
+
+# Insert raw file contents into heredocs
 $Remote = $Remote.Replace('__ATTEST_SH__', $AttestScript)
 $Remote = $Remote.Replace('__SERVICE_UNIT__', $ServiceUnit)
 $Remote = $Remote.Replace('__DROPIN_UNIT__', $DropinUnit)
 
-if ($EnableGating) {
-  $Remote = $Remote.Replace('__GATING_SCRIPT__', $GatingScript)
-} else {
-  $Remote = $Remote.Replace('__GATING_SCRIPT__', '')
-}
-
+# Write remote script to a temp file and invoke RunCommand
 $Temp = [IO.Path]::GetTempFileName().Replace('.tmp','.sh')
 [IO.File]::WriteAllText($Temp, ($Remote -replace "`r`n","`n"), [Text.UTF8Encoding]::UTF8)
 

@@ -12,8 +12,6 @@ StartLimitBurst=5
 Type=oneshot
 EnvironmentFile=-/etc/default/attest
 ExecStart=/opt/azure/containers/attest.sh
-# Post step applies taints/labels based on /var/lib/attest/status.json
-ExecStartPost=/usr/local/bin/attest-gating.sh
 RemainAfterExit=yes
 StandardOutput=journal
 StandardError=journal
